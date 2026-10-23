@@ -82,6 +82,34 @@ G1 的 GPU 产品 ID 在 panvk 模型表里可能未登记（需要加 profile�
 2. Android 17 + 内核 6.12 很新，bionic/proot 兼容性风险低于老机型。
 3. 厂商 Vulkan 1.3 完整可用（dumpsys 显示多处 Vulkan 应用正常创建 device）。
 
+## 5. Phase 2 里程碑 A：Termux 厂商驱动基线（2026-10-23 ✅）
+
+Termux（免 root）+ vulkan-loader-android 直通系统驱动，`vulkaninfo` 成功：
+
+```
+GPU0: Mali-G1-Ultra MC12
+apiVersion    = 1.3.305
+driverVersion = 54.1.0
+vendorID      = 0x13b5 (ARM)
+deviceID      = 0xe8800010   ← PanVK 模型表要登记的 G1-Ultra GPU ID
+driverID      = DRIVER_ID_ARM_PROPRIETARY
+driverInfo    = v1.r54p1-11eac0...
+conformance   = 1.4.1.0
+```
+
+- `/dev/mali0` 在 Termux 里 666 可写 ✅（两次验证：adb shell + Termux）
+- 内核模块确认为 `mali_kbase`（/sys/module/mali_kbase 存在）
+- 实例层为空，实例扩展 15 个（标准 Android 配置）
+
+**部署管线经验**：手机直连 Termux 镜像 403（代理出口 IP 被反爬拦截），
+改为「PC 下载 deb → adb push /sdcard/droiddeck/deb2/ → Termux dpkg -i」，
+该管线已验证可复用，后续所有 Termux 包都这么走。
+
+**下一步（里程碑 B）**：用 NDK 交叉编译 panvk-probe 测试器，
+dlopen MineGraph 的 libvulkan_panfrost.so（bionic），
+验证 PanVK-kbase 能否在 G1-Ultra 上枚举出设备（预期会报 GPU ID 未识别，
+那就到了打 profile 补丁的环节）。
+
 ## 3. 已知风险
 
 1. G1-Ultra 太新：panvk 模型表可能不认识，硬件 profile 需要试出来（参考 G925 参数起步）。
