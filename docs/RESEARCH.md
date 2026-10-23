@@ -110,6 +110,31 @@ dlopen MineGraph 的 libvulkan_panfrost.so（bionic），
 验证 PanVK-kbase 能否在 G1-Ultra 上枚举出设备（预期会报 GPU ID 未识别，
 那就到了打 profile 补丁的环节）。
 
+## 6. MineGraph 构建分析（2026-10-23）
+
+用 NDK 编译的 panvk-probe / hmidump 在真机上做了格式分析：
+
+- `libvulkan_panfrost.so`（Mesa 26.3.0-panvk.4，CSF+JM 双路径）**不导出任何 vk* 符号**，
+  唯一导出是 OBJECT 符号 `HMI`（248 字节）。
+- HMI 布局 = Android HAL 风格模块描述符：
+  - `[0]` magic `HWMT`（反写存储，hw_module_t 标签）+ 版本
+  - `[1]` → "vulkan"（模块 id）
+  - `[2]` → "Mesa 3D Vulkan HAL"（name）
+  - `[3]` → "Mesa 3D"（author）
+  - `[4]` → methods 区（紧邻 HMI 自身）
+- 结论：该 .so 面向 `hw_get_module("vulkan")` 式 HAL 加载通道（他们自己的
+  bionic-vulkan-wrapper 系 wrapper），**不能**用标准 dlsym 方式独立调用。
+
+**决策**：MineGraph 构建降级为参考实现（它的价值是 Mesa 补丁内容本身：
+G615 v11 CSF 适配 + vkd3d robustBufferAccess2 + MEM_ALLOC uAPI 回退）。
+主攻路线改为用 GunaCharanTeja/panvk-kbase-android 补丁栈自编译标准导出的 ICD：
+- Android/Bionic 格式 → 给真机直接用
+- ARM64 glibc 格式 → 给 proot Debian（Steam 管线）用
+构建环境需要 Linux/Termux（脚本自带 build-android.sh / build-glibc.sh）。
+
+工具链现状：NDK r28b 已装（~/.workbuddy/bin/android-ndk/），
+panvk-probe.c / hmidump.c / hmidump2.c 编译管线已打通（PC 交叉编译 → adb push → 真机运行）。
+
 ## 3. 已知风险
 
 1. G1-Ultra 太新：panvk 模型表可能不认识，硬件 profile 需要试出来（参考 G925 参数起步）。
