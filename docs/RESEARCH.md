@@ -170,3 +170,24 @@ panvk-probe.c / hmidump.c / hmidump2.c 编译管线已打通（PC 交叉编译 �
 - winget/微软商店 CDN：国内直连部署超时 0x80072ee2
 - GitHub：直连/代理均不稳 → ghproxy.net 前缀镜像可用（git clone 与 release 下载均验证）
 - gitlab.freedesktop.org、cloud-images.ubuntu.com、archive/USTC apt 源：直连均可达
+
+## Phase 2 里程碑 C：自编译 PanVK bionic ICD 构建成功（2026-10-24）
+
+- `build-android.sh --profile g720-v12-csf --api 35` 输出 `dist/android-g720-v12-csf/libvulkan_panfrost.so`（21.3MB，AArch64）
+- 导出标准 ICD 接口：vk_icdGetInstanceProcAddr / vk_icdGetPhysicalDeviceProcAddr / vk_icdNegotiateLoaderICDInterfaceVersion
+  （与 MineGraph 的 HMI HAL 封装完全不同，可直接挂 loader / proot 管线）
+- 新增 icd-probe.c：免 loader 直连 ICD 接口枚举物理设备（dlopen → vk_icdNegotiate → CreateInstance → EnumeratePhysicalDevices）
+
+### x86_64 主机适配补丁（上游脚本假定 ARM64 Linux 构建机）
+1. 依赖三件套用 NDK 交叉编译为 AArch64 静态库 → work/android-deps/（zlib 1.3.1、expat 2.3.0）
+2. libdrm/zlib/expat 的 pkg-config 垫片写入 work/android-deps/lib/pkgconfig/
+3. meson/android-aarch64.ini：c_args += -I shims/include；c_link_args += -L shims, --allow-shlib-undefined
+4. build-android.sh 第 54 行：cpp_link_args 增补 -L shims + --allow-shlib-unsigned（注意 meson 列表语法需整体加引号，
+   且必须用 cpp_link_args —— C++ 链接的目标不吃 c_link_args）
+5. 坑位清单：wsl.exe 参数里的 shell 变量会被吞（一律字面路径）；Git Bash 路径转换需 MSYS_NO_PATHCONV=1；
+   WSL 发行版重启会清 /tmp；API 必须 >= 29（AHardwareBuffer_isSupported）
+
+### 待真机验证（icd-probe）
+- 预期：EnumeratePhysicalDevices 返回 1 个设备，deviceName 含 G1-Ultra，deviceID 匹配 0xe8800010
+- 手机断连（用户外出，无线调试休眠），恢复后执行：
+  adb push libvulkan_panfrost.so icd-probe libdrm.so → LD_LIBRARY_PATH=/data/local/tmp ./icd-probe ./libvulkan_panfrost.so
