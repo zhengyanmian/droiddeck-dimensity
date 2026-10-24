@@ -474,3 +474,29 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 5. AHB 内容扫描器（每 60 帧自检，当前 0 坏行）
 
 最终验证：4400+ 帧 / 75s+ 连续运行零 DEVICE_LOST，画面干净无伪影。debug.panvk.swap/finish/ms 属性保留供后续回归实验。
+
+## 里程碑 I（2026-10-24）：MTK 分配器修复 + X11 swapchain 直通 300 帧
+
+### 新发现的 MT6993 内核分配器怪癖（三个 GPU MMU fault 全解码）
+用 panthor（主线 CSF 驱动）的异常表解码了全部故障码：
+- 0x88 = GPU_SHAREABILITY_FAULT（APK 双驱动并发场景）
+- 0xc3 = TRANSLATION_FAULT_3（legacy MEM_ALLOC 内存 GPU 页表从未映射 → GPU 完全不可见）
+- 0xcb = PERM_FAULT_3（dma_heap/mtk_mm 导入可映射但 GPU 写权限被拒）
+- kernel ABI 实测（scan12）：MEM_ALLOC 只接受 32B；flag 加位（NEED_MMAP/bit14、bit26）全被拒 → 无法用 flag 修复
+- scan13 尺寸扫描：gralloc 128×128+CPU_READ_OFTEN 的 native_handle data[1] 才是真正的 dmabuf（data[0] 导入必 ENOMEM；GPU-only usage 的 AHB 整个不可导入）
+
+### 修复方案（v0.15 驱动）
+1. dma_heap 名字回退列表：/dev/dma_heap/mtk_mm → mtk_mm-uncached → system（MTK 没有 system 堆，原代码静默失败全掉进坏路径）
+2. 新分配路由：<128KB → 原生 MEM_ALLOC（GPU 读正常，池 BO 只读够用）；≥128KB（GPU 要写的图像/大缓冲）→ AHardwareBuffer 分配（BLOB 或方形 RGBA8 + CPU_READ_OFTEN）→ 取 native_handle 里尺寸匹配的 dmabuf fd → 走已验证的 40B MEM_IMPORT
+3. FORCE_NATIVE 标志：CS 环缓冲、tracebuf、CSF_EVENT 等内核按 VA 查找的对象必须原生分配（CS_QUEUE_REGISTER 会 ENOENT）
+4. WB_MMAP/CACHED_CPU 在 MTK 导入上一律 ENOMEM，全路径清除
+5. 导入 ENOMEM 重试 8→32 次
+
+### 结果
+- alloc-probe（普通分配图像 300 帧 GPU 渲染）：300/300 ✅（之前第 0 帧 fence 超时）
+- **xcb-vk（Termux:X11 + XCB surface + swapchain + DRI3 present）：300/300 XCB_VK_SUCCESS ✅**
+- PanVK 驱动首次通过标准 X11 桌面路径上屏 —— 这就是 Wine/DXVK/Steam 在 proot 里呈现画面的同款路径
+
+### 新工具
+- kbase-scan12（MEM_ALLOC ABI 探针）、kbase-scan13（导入尺寸/枚举 bisect）、alloc-probe（普通分配循环渲染）、xcb-vk（XCB+Vulkan 冒烟测试，CBVK_NOACQUIRE/NOPRESENT 实验钩子）
+- WSL 交叉构建 glibc panvk 成功（dist/glibc-g720-v12-csf/，aarch64 glibc + x11 platform）——proot Ubuntu 直接可用
