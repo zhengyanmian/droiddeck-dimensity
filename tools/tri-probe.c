@@ -145,6 +145,8 @@ typedef int (*PFN_vkNegotiateLoaderICDInterfaceVersion)(int *version);
     PFN_vkFreeMemory pFreeMem = GD(FreeMemory);
     PFN_vkDestroyImage pDestroyImg = GD(DestroyImage);
     PFN_vkDestroyBuffer pDestroyBuf = GD(DestroyBuffer);
+    PFN_vkCmdCopyImageToBuffer pCmdCopyImgToBuf = GD(CmdCopyImageToBuffer);
+    CHK(pCmdCopyImgToBuf, "vkCmdCopyImageToBuffer");
 
     VkQueue queue; pGetQueue(dev, gfx, 0, &queue);
 
@@ -258,6 +260,10 @@ typedef int (*PFN_vkNegotiateLoaderICDInterfaceVersion)(int *version);
     pCmdScissor(cmd, 0, 1, &sc);
     pCmdDraw(cmd, 3, 1, 0, 0);
     pCmdEndRP(cmd);
+    /* renderpass finalLayout = TRANSFER_SRC_OPTIMAL, so copy can follow directly */
+    VkBufferImageCopy bic = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                              .imageOffset = { 0, 0, 0 }, .imageExtent = { W, H, 1 } };
+    pCmdCopyImgToBuf(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &bic);
     pEndCmd(cmd);
     printf("[ok] recorded\n");
 

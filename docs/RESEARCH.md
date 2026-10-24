@@ -325,3 +325,11 @@ GPU0:
 ### 状态
 - 里程碑 A→F 全部完成：诊断 → 硬件探针 → 自编译 ICD → 真机初始化 → 真机渲染 → loader 集成
 - 下一步（Phase 4）：DroidDeck 场景管线——绕开 gamescope 的 launch 链路 / proot glibc 消费端 / 显示输出（dmabuf 合成）
+
+### 更正（v0.11）：CopyImageToBuffer "已知问题"撤销
+- 复查 tri-probe 源码发现：探针从未录制 vkCmdCopyImageToBuffer 命令（注释声称有），
+  读回 buffer 为未初始化内存 → 全 0 是**探针 bug，非驱动 bug**
+- 修复：renderpass（finalLayout=TRANSFER_SRC_OPTIMAL）后直接追加 copy 命令，
+  无需额外 barrier（renderpass 隐式外部依赖覆盖）
+- 真机结果：RENDER_PASS_SUCCESS (copy + direct)，四点像素检查全 OK
+  → 图形管线 + transfer 路径全部无已知问题
