@@ -27,6 +27,9 @@ float4 main(PIn i) : SV_Target { return i.col; }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    freopen("C:\\test\\log.txt", "w", stdout);
+    AllocConsole();
     IDXGIFactory1 *factory = NULL;
     CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory);
     if (!factory) { printf("FAIL CreateDXGIFactory1\n"); return 1; }

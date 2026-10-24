@@ -533,3 +533,12 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 - wine GUI/exec 在 box64+proot 三层嵌套下稳定崩溃（cmd 控制台路径可活）
 - 结论：转向 Mobox 架构（olegos2/mobox，成熟方案绕开 proot），PanVK ICD 通过 VK_DRIVER_FILES 注入
 - 明日 M1：Mobox APK 安装 + ICD 注入 + d3d11tri 验证
+
+## 补充诊断（22:30-22:47）：d3d11tri 进程创建层锁定
+
+- proot+box64+wine --version ✓（BOX64_LOG 下 wine-11.20 输出）
+- wine cmd ✓（常驻 wineserver 时 rc=0）
+- wine d3d11tri.exe（任何 exe）→ 秒死 rc=1，wine 自身零输出、exe freopen 文件日志未创建 → 死在 exe 进程创建（wineserver/PE load），与 DXVK 无关（移除 DXVK dll 同样死）
+- WINEDLLOVERRIDES 环境变量法替代 reg add 成功（不再依赖注册表写入）
+- stdio 在此栈完全不可靠 → 测试程序改为 freopen 直写文件（已重建）
+- 下一步两选：A) core dump + gdb 专项分析 wine 进程创建；B) Mobox（绕开 proot）
