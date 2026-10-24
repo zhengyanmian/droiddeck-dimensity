@@ -411,3 +411,32 @@ GPU0:
 - 显示桥下一步：panvk AHB → SurfaceView/SurfaceFlinger 上屏（需一个宿主 APK 或
   Termux:X11 场景）；VK_ANDROID_native_buffer/VK_KHR_swapchain 已在设备扩展列表
 - proot glibc 消费端管线待启动
+
+## 里程碑 H（2026-10-24）：宿主 APK 真上屏 —— PanVK 帧第一次出现在手机屏幕上
+
+### 架构（无 Vulkan loader 参与）
+```
+[PanVK (Mesa, driver-direct dlopen)] --VK_ANDROID_external_memory_android_hardware_buffer--> AHardwareBuffer (gralloc, 1272x2631)
+[Vendor GL (EGL)] --eglGetNativeClientBufferANDROID + EGLImage + samplerExternalOES--> SurfaceView -> SurfaceFlinger
+```
+- NativeActivity + hasCode=false：无 dex、无 Java，纯 native APK（aapt 打包、zipalign、debug key v1 签名，WSL 全自建工具链）
+- WSL 构建链：dl.google.com 下载 build-tools r34 + platform-34 android.jar；apt 装 default-jre-headless/glslang-tools
+- APK 打包 3 个 lib：libpanvk_host.so（45KB）、libvulkan_panfrost.so（22MB，v0.12+诊断）、libdrm.so（shims 版，NEEDED 补齐）
+- adb 经柚谈工具箱无线连接（192.168.1.11:38467），adb install 直装
+
+### 结果
+- `vkCreateInstance`（driver-direct）→ PD Mali-G1-Ultra MC12 api 1.4.363 → vkCreateDevice → AHB 1272x2631 双端导入（VK 渲染 + GL 采样）→ **用户肉眼确认：红底绿三角上屏，且转动了数帧**
+- 首帧 CPU 自检：SELFTEST center px G=217 → GREEN_OK
+- app 生命周期健壮：同进程 activity 重启（重置静态状态）、TERM_WINDOW 后台存活、force-stop 干净退出
+
+### 排错记录（3 个根因）
+1. dlopen 失败 libdrm.so：系统无 libdrm，Termux 里是单独推的 —— 把 shims/libdrm.so 打进 APK lib/arm64-v8a
+2. 进程复用 + 静态 vk_fatal：activity 重启后 render_frame 被旧 vk_fatal 短路 → 黑屏无日志；android_main 入口重置全部状态
+3. **vkCreateInstance r=-7 = VK_ERROR_EXTENSION_NOT_PRESENT**（-7 不是 INITIALIZATION_FAILED，记错码排查绕远）：panvk 实例级扩展表没有 VK_ANDROID_external_memory_android_hardware_buffer（它是 device 级），ahb-probe 有过滤逻辑、host 代码搬运时丢了。且 Mesa vk_errorf 的 WARNING 级日志在 Android 默认被过滤 → 静默失败。给 panvk_CreateInstance/vk_instance_init 加 mesa_loge 诊断后定位
+
+### 已知问题（下一步）：连续提交 ~0.5s 后 CSF 组 fatal
+- `kbase: CSF group 0/1/2 fatal error: status 0x004c0488 (exception 0x88), sideband 0xffffffffffffffff` → 随后 submit r=-4 (DEVICE_LOST)
+- 状态解码：exception type=LSB=0x88（CS 资源类异常，疑 tiler heap 资源相关），data=0x004c04
+- 单次提交永远正常（所有 Termux 探针 + 首帧），连续提交约 45 帧后死 → 疑似与 vendor GL（同进程双 kbase 客户端）或 tiler heap 增长相关
+- 缓解已实装：vk_dead 状态下停 VK 提交、GL 继续合成最后一帧（画面稳定不闪退）
+- 待查：app 与 Termux 的 kbase 上下文差异、heap 初始化日志、限制提交频率实验
