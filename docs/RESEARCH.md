@@ -333,3 +333,11 @@ GPU0:
   无需额外 barrier（renderpass 隐式外部依赖覆盖）
 - 真机结果：RENDER_PASS_SUCCESS (copy + direct)，四点像素检查全 OK
   → 图形管线 + transfer 路径全部无已知问题
+
+### 更正（v0.11）：CopyImageToBuffer "已知问题"撤销
+- 复查 tri-probe 源码发现：探针从未录制 vkCmdCopyImageToBuffer 命令（注释声称有），
+  读回 buffer 为未初始化内存 → 全 0 是**探针 bug，非驱动 bug**
+- 修复：renderpass（finalLayout=TRANSFER_SRC_OPTIMAL）后直接追加 copy 命令，
+  无需额外 barrier（renderpass 隐式外部依赖覆盖）
+- 真机结果：RENDER_PASS_SUCCESS (copy + direct)，四点像素检查全 OK
+  → 图形管线 + transfer 路径全部无已知问题
