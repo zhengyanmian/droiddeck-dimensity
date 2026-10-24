@@ -440,3 +440,8 @@ GPU0:
 - 单次提交永远正常（所有 Termux 探针 + 首帧），连续提交约 45 帧后死 → 疑似与 vendor GL（同进程双 kbase 客户端）或 tiler heap 增长相关
 - 缓解已实装：vk_dead 状态下停 VK 提交、GL 继续合成最后一帧（画面稳定不闪退）
 - 待查：app 与 Termux 的 kbase 上下文差异、heap 初始化日志、限制提交频率实验
+
+### CSF fatal 对照实验（决定性）
+- loop-probe（ahb-probe 改 300 帧循环提交，fence/帧，无 vendor GL）：adb shell 环境 **ALL 300 FRAMES OK + 像素全对**
+- 结论：panvk 连续提交本身稳定（shell 环境 300 帧）；app 内 ~200 帧死亡 → 根因是 **同进程内 vendor GL 与 panvk 双 kbase 客户端交互**（vendor EGL 每次 swap 提交后，固件最终杀掉 panvk 的 CSG；exception 0x88, sideband 0xffffffffffffffff 疑为组资源被回收）
+- 下一步实验方向：① app 内降低 GL swap 频率看 fatal 延迟是否变化；② GL 首帧后停止 swap（静态画面）验证零冲突；③ 查 kbase CSG 槽位/优先级策略（vendor driver 常驻 CSG 是否挤占）；④ 极端方案：panvk 侧换 fence+外部 sync 或降低 CSG 需求
