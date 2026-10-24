@@ -18,6 +18,8 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/system_properties.h>
 
 #include <android/log.h>
 #include <android/native_activity.h>
@@ -67,21 +69,39 @@ static int vk_ready;
 static int vk_fatal;
 static int vk_dead;   /* DEVICE_LOST: stop VK submits, keep GL presenting */
 
+/* CSF-fatal experiments (configurable via adb shell setprop debug.panvk.*):
+ *   debug.panvk.swap : GL swap every N VK frames; 0 = GL swap only on first frame
+ *   debug.panvk.ms   : target frame interval in ms (default 16, pacing keeps VK rate fixed)
+ * Counters are printed when DEVICE_LOST happens so we can correlate. */
+static int cfg_swap_every = 1;
+static int cfg_frame_ms = 16;
+static int cfg_glfinish;   /* glFinish() after swap: serialize vendor GL vs panvk */
+static long vk_frame, gl_swap;
+
 /* ------------------------------------------------------------------ */
 /* Per-window render target                                            */
 /* ------------------------------------------------------------------ */
 typedef struct {
     ANativeWindow *win;
     int w, h;
+    EGLSurface surf;
+} Target;
+
+/* One renderable/presentable buffer: AHB imported into VK (write) and GL (read).
+ * Two planes are alternated so PanVK writes plane[cur] while the compositor
+ * still consumes plane[cur^1] — no in-place read/write overlap (tearing). */
+typedef struct {
     AHardwareBuffer *ahb;
     VkImage img;
     VkDeviceMemory mem;
     VkImageView view;
     VkFramebuffer fb;
-    EGLSurface surf;
-    GLuint tex;
     EGLImageKHR eimg;
-} Target;
+    GLuint tex;
+} Plane;
+
+static Plane planes[2];
+static int cur_plane;
 
 static Target tgt;
 static int tgt_valid;
@@ -383,31 +403,33 @@ static void destroy_target(void)
 {
     if (!tgt_valid) return;
     GD(DeviceWaitIdle)(dev);
-    if (egl_ready) eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (tgt.fb) GD(DestroyFramebuffer)(dev, tgt.fb, NULL);
-    if (tgt.view) GD(DestroyImageView)(dev, tgt.view, NULL);
-    if (tgt.img) GD(DestroyImage)(dev, tgt.img, NULL);
-    if (tgt.mem) GD(FreeMemory)(dev, tgt.mem, NULL);
-    if (tgt.eimg && egl_ready) eglDestroyImageKHR(dpy, tgt.eimg);
-    if (tgt.tex && egl_ready) { eglMakeCurrent(dpy, tgt.surf ? tgt.surf : EGL_NO_SURFACE, tgt.surf ? tgt.surf : EGL_NO_SURFACE, ctx); glDeleteTextures(1, &tgt.tex); eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT); }
+    /* GL object deletion needs a current context: make the window surface
+     * current (if we still have one) before tearing down EGL objects. */
+    if (egl_ready && tgt.surf) eglMakeCurrent(dpy, tgt.surf, tgt.surf, ctx);
+    for (int i = 0; i < 2; i++) {
+        Plane *p = &planes[i];
+        if (p->fb) GD(DestroyFramebuffer)(dev, p->fb, NULL);
+        if (p->view) GD(DestroyImageView)(dev, p->view, NULL);
+        if (p->img) GD(DestroyImage)(dev, p->img, NULL);
+        if (p->mem) GD(FreeMemory)(dev, p->mem, NULL);
+        if (p->tex) glDeleteTextures(1, &p->tex);
+        if (p->eimg && egl_ready) eglDestroyImageKHR(dpy, p->eimg);
+        if (p->ahb) AHardwareBuffer_release(p->ahb);
+    }
     if (tgt.surf && egl_ready) eglDestroySurface(dpy, tgt.surf);
-    if (tgt.ahb) AHardwareBuffer_release(tgt.ahb);
     if (tgt.win) ANativeWindow_release(tgt.win);
+    memset(planes, 0, sizeof planes);
     memset(&tgt, 0, sizeof tgt);
     tgt_valid = 0;
     LOGI("target destroyed");
 }
 
-static int create_target(ANativeWindow *win)
+/* create one AHB-backed plane (VK color attachment + GL external texture) */
+static int create_plane(int i, uint32_t mem_idx,
+                        PFN_vkGetAndroidHardwareBufferPropertiesANDROID pGetAHBProps)
 {
-    if (!egl_ready && egl_init(win) != 0) return -1;
-
-    memset(&tgt, 0, sizeof tgt);
-    tgt.win = win;
-    ANativeWindow_acquire(win);
-    tgt.w = ANativeWindow_getWidth(win);
-    tgt.h = ANativeWindow_getHeight(win);
-    LOGI("create_target %dx%d", tgt.w, tgt.h);
+    Plane *p = &planes[i];
+    memset(p, 0, sizeof *p);
 
     AHardwareBuffer_Desc adesc = {
         .width = (uint64_t)tgt.w, .height = (uint64_t)tgt.h, .layers = 1,
@@ -415,16 +437,13 @@ static int create_target(ANativeWindow *win)
         .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE
                | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
     };
-    if (AHardwareBuffer_allocate(&adesc, &tgt.ahb) != 0 || !tgt.ahb) { die_fatal("AHB allocate"); return -1; }
+    if (AHardwareBuffer_allocate(&adesc, &p->ahb) != 0 || !p->ahb) { die_fatal("AHB allocate"); return -1; }
 
-    PFN_vkGetAndroidHardwareBufferPropertiesANDROID pGetAHBProps =
-        (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)gipa(inst, "vkGetAndroidHardwareBufferPropertiesANDROID");
     VkAndroidHardwareBufferPropertiesANDROID ahbprops = {
         .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID };
     VkResult r;
-    if ((r = pGetAHBProps(dev, tgt.ahb, &ahbprops)) != VK_SUCCESS) { LOGE("GetAHBProps r=%d", r); die_fatal("GetAHBProps"); return -1; }
-    uint32_t mem_idx = __builtin_ctz(ahbprops.memoryTypeBits);
-    LOGI("[ok] AHB %dx%d size=%llu memType=%u", tgt.w, tgt.h,
+    if ((r = pGetAHBProps(dev, p->ahb, &ahbprops)) != VK_SUCCESS) { LOGE("GetAHBProps r=%d", r); die_fatal("GetAHBProps"); return -1; }
+    LOGI("[ok] plane %d AHB %dx%d size=%llu memType=%u", i, tgt.w, tgt.h,
          (unsigned long long)ahbprops.allocationSize, mem_idx);
 
     VkExternalMemoryImageCreateInfo extimg = {
@@ -437,51 +456,88 @@ static int create_target(ANativeWindow *win)
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .samples = VK_SAMPLE_COUNT_1_BIT };
-    if ((r = GD(CreateImage)(dev, &ici, NULL, &tgt.img)) != VK_SUCCESS) { LOGE("CreateImage r=%d", r); die_fatal("CreateImage(AHB)"); return -1; }
+    if ((r = GD(CreateImage)(dev, &ici, NULL, &p->img)) != VK_SUCCESS) { LOGE("CreateImage r=%d", r); die_fatal("CreateImage(AHB)"); return -1; }
 
     VkImportAndroidHardwareBufferInfoANDROID imp = {
-        .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = tgt.ahb };
+        .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = p->ahb };
     VkMemoryDedicatedAllocateInfo ded = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .image = tgt.img };
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .image = p->img };
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .pNext = &ded,
                                  .allocationSize = ahbprops.allocationSize,
                                  .memoryTypeIndex = mem_idx };
-    if ((r = GD(AllocateMemory)(dev, &mai, NULL, &tgt.mem)) != VK_SUCCESS) { LOGE("AllocMem r=%d", r); die_fatal("AllocMem(import AHB)"); return -1; }
+    if ((r = GD(AllocateMemory)(dev, &mai, NULL, &p->mem)) != VK_SUCCESS) { LOGE("AllocMem r=%d", r); die_fatal("AllocMem(import AHB)"); return -1; }
     VkBindImageMemoryInfo bimi = { .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
-                                   .image = tgt.img, .memory = tgt.mem, .memoryOffset = 0 };
+                                   .image = p->img, .memory = p->mem, .memoryOffset = 0 };
     if ((r = GD(BindImageMemory2)(dev, 1, &bimi)) != VK_SUCCESS) { die_fatal("BindImageMemory2"); return -1; }
 
     VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = tgt.img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .image = p->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-    GD(CreateImageView)(dev, &vci, NULL, &tgt.view);
+    GD(CreateImageView)(dev, &vci, NULL, &p->view);
     VkFramebufferCreateInfo fbci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .renderPass = rp, .attachmentCount = 1, .pAttachments = &tgt.view,
+        .renderPass = rp, .attachmentCount = 1, .pAttachments = &p->view,
         .width = (uint32_t)tgt.w, .height = (uint32_t)tgt.h, .layers = 1 };
-    GD(CreateFramebuffer)(dev, &fbci, NULL, &tgt.fb);
+    GD(CreateFramebuffer)(dev, &fbci, NULL, &p->fb);
 
-    /* EGL side: surface on the window + texture backed by the AHB */
-    tgt.surf = eglCreateWindowSurface(dpy, econfig, (EGLNativeWindowType)win, NULL);
-    if (!tgt.surf) { LOGE("eglCreateWindowSurface 0x%x", eglGetError()); die_fatal("surface"); return -1; }
-    eglMakeCurrent(dpy, tgt.surf, tgt.surf, ctx);
-
-    EGLClientBuffer nwb = eglGetNativeClientBufferANDROID(tgt.ahb);
+    EGLClientBuffer nwb = eglGetNativeClientBufferANDROID(p->ahb);
     if (!nwb) { LOGE("eglGetNativeClientBufferANDROID 0x%x", eglGetError()); die_fatal("client buffer"); return -1; }
-    tgt.eimg = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, nwb, NULL);
-    if (!tgt.eimg) { LOGE("eglCreateImageKHR 0x%x", eglGetError()); die_fatal("EGLImage"); return -1; }
+    p->eimg = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, nwb, NULL);
+    if (!p->eimg) { LOGE("eglCreateImageKHR 0x%x", eglGetError()); die_fatal("EGLImage"); return -1; }
 
-    glGenTextures(1, &tgt.tex);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tgt.tex);
+    glGenTextures(1, &p->tex);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, p->tex);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, tgt.eimg);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, p->eimg);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    return 0;
+}
 
+static int create_target(ANativeWindow *win)
+{
+    if (!egl_ready && egl_init(win) != 0) return -1;
+
+    memset(&tgt, 0, sizeof tgt);
+    memset(planes, 0, sizeof planes);
+    tgt.win = win;
+    ANativeWindow_acquire(win);
+    tgt.w = ANativeWindow_getWidth(win);
+    tgt.h = ANativeWindow_getHeight(win);
+    LOGI("create_target %dx%d", tgt.w, tgt.h);
+
+    PFN_vkGetAndroidHardwareBufferPropertiesANDROID pGetAHBProps =
+        (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)gipa(inst, "vkGetAndroidHardwareBufferPropertiesANDROID");
+
+    /* EGL window surface (single, shared by both planes) */
+    tgt.surf = eglCreateWindowSurface(dpy, econfig, (EGLNativeWindowType)win, NULL);
+    if (!tgt.surf) { LOGE("eglCreateWindowSurface 0x%x", eglGetError()); die_fatal("surface"); return -1; }
+    eglMakeCurrent(dpy, tgt.surf, tgt.surf, ctx);
+    eglSwapInterval(dpy, 1);   /* vsync-paced queueing */
+
+    /* probe memory type with a properties query on a temp AHB of plane 0 size */
+    {
+        AHardwareBuffer_Desc probe_desc = {
+            .width = (uint64_t)tgt.w, .height = (uint64_t)tgt.h, .layers = 1,
+            .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+            .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+        };
+        AHardwareBuffer *probe = NULL;
+        if (AHardwareBuffer_allocate(&probe_desc, &probe) != 0 || !probe) { die_fatal("AHB probe"); return -1; }
+        VkAndroidHardwareBufferPropertiesANDROID ahbprops = {
+            .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID };
+        if (pGetAHBProps(dev, probe, &ahbprops) != VK_SUCCESS) { AHardwareBuffer_release(probe); die_fatal("GetAHBProps"); return -1; }
+        uint32_t mem_idx = __builtin_ctz(ahbprops.memoryTypeBits);
+        AHardwareBuffer_release(probe);
+        for (int i = 0; i < 2; i++)
+            if (create_plane(i, mem_idx, pGetAHBProps) != 0) return -1;
+    }
+
+    cur_plane = 0;
     tgt_valid = 1;
-    LOGI("[ok] target created (AHB imported into both VK and GL)");
+    LOGI("[ok] target created (2 planes, AHB imported into both VK and GL)");
     return 0;
 }
 
@@ -513,6 +569,23 @@ static void render_frame(void)
         goto present_only;
     }
 
+    /* frame pacing: fixed VK rate regardless of GL swap frequency */
+    {
+        static struct timespec next;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (next.tv_sec == 0) next = now;
+        if (now.tv_sec < next.tv_sec ||
+            (now.tv_sec == next.tv_sec && now.tv_nsec < next.tv_nsec)) {
+            long ns = (next.tv_sec - now.tv_sec) * 1000000000L + (next.tv_nsec - now.tv_nsec);
+            if (ns > 0) clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        }
+        next.tv_nsec += cfg_frame_ms * 1000000L;
+        while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+    }
+    vk_frame++;
+    if (vk_frame % 100 == 0) LOGI("heartbeat vk_frame=%ld gl_swap=%ld", vk_frame, gl_swap);
+
     static float angle;
     angle += 0.03f;
     if (angle > 6.2832f) angle -= 6.2832f;
@@ -537,7 +610,7 @@ static void render_frame(void)
     if (pBegin(cmd, &bbi) != VK_SUCCESS) return;
     VkClearValue clear = { .color = { { 1.0f, 0.0f, 0.0f, 1.0f } } };
     VkRenderPassBeginInfo rpbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = rp, .framebuffer = tgt.fb, .renderArea = { { 0, 0 }, { (uint32_t)tgt.w, (uint32_t)tgt.h } },
+        .renderPass = rp, .framebuffer = planes[cur_plane].fb, .renderArea = { { 0, 0 }, { (uint32_t)tgt.w, (uint32_t)tgt.h } },
         .clearValueCount = 1, .pClearValues = &clear };
     pCmdBeginRP(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     pCmdBindPipe(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gpipe);
@@ -553,7 +626,8 @@ static void render_frame(void)
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
     VkResult r = pSubmit(queue, 1, &si, fence);
     if (r != VK_SUCCESS) {
-        LOGE("submit r=%d (%s)", r, r == VK_ERROR_DEVICE_LOST ? "DEVICE_LOST" : "error");
+        LOGE("submit r=%d (%s) at vk_frame=%ld gl_swap=%ld", r,
+             r == VK_ERROR_DEVICE_LOST ? "DEVICE_LOST" : "error", vk_frame, gl_swap);
         if (r == VK_ERROR_DEVICE_LOST || r == VK_ERROR_INITIALIZATION_FAILED) {
             vk_dead = 1;
             LOGE("disabling further VK submits; keeping last frame on screen");
@@ -563,36 +637,83 @@ static void render_frame(void)
     pWaitF(dev, 1, &fence, VK_TRUE, 5000000000ULL);
     pResetF(dev, 1, &fence);
 
+    /* periodic content scan: each row of a healthy frame has at most one
+     * red->green transition (the triangle span). Multiple runs in a row mean
+     * stale (previous-frame) content survived in that row — lost bins. */
+    if (vk_frame % 60 == 0) {
+        void *adata = NULL;
+        if (AHardwareBuffer_lock(planes[cur_plane].ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &adata) == 0 && adata) {
+            AHardwareBuffer_Desc rd; AHardwareBuffer_describe(planes[cur_plane].ahb, &rd);
+            uint32_t stride = rd.stride ? rd.stride : (uint32_t)tgt.w;
+            int bad_rows = 0, first_bad = -1, max_runs = 0;
+            for (int y = 0; y < tgt.h; y++) {
+                const uint32_t *row = (const uint32_t *)((const uint8_t *)adata + (size_t)y * stride * 4);
+                int runs = 0, ing = 0;
+                for (int x = 0; x < tgt.w; x++) {
+                    uint32_t px = row[x];
+                    int g = ((px >> 8) & 0xff) > 200 && (px & 0xff) < 50;
+                    if (g && !ing) { runs++; ing = 1; }
+                    else if (!g && ing) ing = 0;
+                }
+                if (runs > 1) { bad_rows++; if (first_bad < 0) first_bad = y; if (runs > max_runs) max_runs = runs; }
+            }
+            AHardwareBuffer_unlock(planes[cur_plane].ahb, NULL);
+            LOGI("SCAN plane=%d frame=%ld bad_rows=%d first_bad=%d max_runs=%d",
+                 cur_plane, vk_frame, bad_rows, first_bad, max_runs);
+        }
+    }
+
     /* first-frame CPU self-check of the AHB content (like ahb-probe) */
     if (!selftest_done) {
         selftest_done = 1;
         void *adata = NULL;
-        if (AHardwareBuffer_lock(tgt.ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &adata) == 0 && adata) {
-            AHardwareBuffer_Desc rd; AHardwareBuffer_describe(tgt.ahb, &rd);
+        if (AHardwareBuffer_lock(planes[cur_plane].ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &adata) == 0 && adata) {
+            AHardwareBuffer_Desc rd; AHardwareBuffer_describe(planes[cur_plane].ahb, &rd);
             uint32_t stride = rd.stride ? rd.stride : (uint32_t)tgt.w;
             const unsigned char *p = (const unsigned char *)adata
                 + (size_t)(tgt.h / 2) * stride * 4 + (size_t)(tgt.w / 2) * 4;
             LOGI("SELFTEST center px R=%u G=%u B=%u A=%u -> %s",
                  p[0], p[1], p[2], p[3],
                  (p[1] > 200 && p[0] < 50) ? "GREEN_OK" : "NOT_GREEN");
-            AHardwareBuffer_unlock(tgt.ahb, NULL);
+            AHardwareBuffer_unlock(planes[cur_plane].ahb, NULL);
         } else {
             LOGI("SELFTEST skipped (AHB lock failed)");
         }
     }
 
-    /* GL compositor: draw the AHB texture over the whole window */
+    /* GL compositor: draw the AHB texture over the whole window.
+     * Experiment hook: cfg_swap_every == 0 -> present only on the very first
+     * frame (zero GL submits afterwards); N > 1 -> present every N VK frames. */
 present_only:
     if (!egl_ready || !tgt_valid) return;
+    if (cfg_swap_every == 0) {
+        if (gl_swap > 0) return;            /* already presented once */
+    } else if (vk_frame % cfg_swap_every != 0) {
+        return;                              /* skip this frame's swap */
+    }
     eglMakeCurrent(dpy, tgt.surf, tgt.surf, ctx);
     glViewport(0, 0, tgt.w, tgt.h);
     glUseProgram(glprog);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tgt.tex);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, planes[cur_plane].tex);
+    /* Re-create the EGLImage every frame: the persistent EGLImage let the
+     * vendor GPU sample stale cache lines after PanVK rewrote the AHB
+     * (speckles exactly at moving edges). Per-frame create/destroy forces a
+     * kbase map/unmap round trip (BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP). */
+    EGLClientBuffer nwb = eglGetNativeClientBufferANDROID(planes[cur_plane].ahb);
+    EGLImageKHR fresh = nwb ? eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, nwb, NULL) : NULL;
+    if (fresh) glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, fresh);
     glUniform1i(uTexLoc, 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (cfg_glfinish)
+        glFinish();   /* finish BEFORE queueing: the compositor must never scan
+                         out a buffer the GPU is still writing (edge trails) */
+    if (fresh) eglDestroyImageKHR(dpy, fresh);
     if (!eglSwapBuffers(dpy, tgt.surf))
         LOGE("eglSwapBuffers 0x%x", eglGetError());
+    else
+        gl_swap++;
+    cur_plane ^= 1;   /* next VK frame renders into the other plane */
 }
 
 /* ------------------------------------------------------------------ */
@@ -647,6 +768,19 @@ void android_main(struct android_app *app)
     rp = VK_NULL_HANDLE; pl = VK_NULL_HANDLE; gpipe = VK_NULL_HANDLE;
     cmdpool = VK_NULL_HANDLE; cmd = VK_NULL_HANDLE; fence = VK_NULL_HANDLE;
     vk_ready = 0; vk_fatal = 0; vk_dead = 0;
+    vk_frame = 0; gl_swap = 0;
+
+    /* read experiment config: adb shell setprop debug.panvk.swap N / debug.panvk.ms N */
+    {
+        char v[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("debug.panvk.swap", v) > 0) cfg_swap_every = atoi(v);
+        else cfg_swap_every = 1;
+        if (__system_property_get("debug.panvk.finish", v) > 0) cfg_glfinish = atoi(v);
+        else cfg_glfinish = 1;
+        if (__system_property_get("debug.panvk.ms", v) > 0 && atoi(v) >= 2) cfg_frame_ms = atoi(v);
+        else cfg_frame_ms = 16;
+        LOGI("cfg: swap_every=%d frame_ms=%d glfinish=%d", cfg_swap_every, cfg_frame_ms, cfg_glfinish);
+    }
 
     LOGI("panvk_host starting (pid %d)", getpid());
 

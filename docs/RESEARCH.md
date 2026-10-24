@@ -445,3 +445,32 @@ GPU0:
 - loop-probe（ahb-probe 改 300 帧循环提交，fence/帧，无 vendor GL）：adb shell 环境 **ALL 300 FRAMES OK + 像素全对**
 - 结论：panvk 连续提交本身稳定（shell 环境 300 帧）；app 内 ~200 帧死亡 → 根因是 **同进程内 vendor GL 与 panvk 双 kbase 客户端交互**（vendor EGL 每次 swap 提交后，固件最终杀掉 panvk 的 CSG；exception 0x88, sideband 0xffffffffffffffff 疑为组资源被回收）
 - 下一步实验方向：① app 内降低 GL swap 频率看 fatal 延迟是否变化；② GL 首帧后停止 swap（静态画面）验证零冲突；③ 查 kbase CSG 槽位/优先级策略（vendor driver 常驻 CSG 是否挤占）；④ 极端方案：panvk 侧换 fence+外部 sync 或降低 CSG 需求
+
+## 里程碑 H 收尾（v0.14）：CSF fatal 与边缘残影双双根治
+
+### 控制变量实验（debug.panvk.* 系统属性动态配置）
+| 实验 | 配置 | 结果 |
+|---|---|---|
+| 基线 | 每帧 GL swap，无串行 | ~200 帧（3.5s）CSF fatal → DEVICE_LOST |
+| A | GL 只 swap 首帧（N=0） | 1200+ 帧零死亡（排除 VK 帧数/墙钟时间） |
+| B | 每 8 帧 swap（N=8） | 2800 帧 / 349 swap 零死亡（排除 GL swap 次数） |
+| C | 每帧 swap + glFinish | 2400+ 帧零死亡，动画持续 |
+
+### 根因 1：CSF 组 fatal（exception 0x88）= 双 kbase 客户端并发
+PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU 提交在时间上重叠时固件杀 PanVK 的 CSG。`glFinish()` 强制每帧串行后根治。帧率固定 60fps（clock_nanosleep 节流）保证实验变量单一。
+
+### 根因 2：边缘残影 = vendor GPU 采样陈旧缓存行
+现象：红底上绿色碎线沿三角形移动边缘拖尾、三角形内部红色碎线（仅运动时可见，静止/探针全绿）。
+逐层排除：
+- AHB 内容 CPU 逐行扫描（每行红→绿跳变计数，>1 段=残留）：**0 坏行 / 1200 帧** → PanVK 渲染完美
+- glFinish 挪到 swap 之前：无效 → 排除"GPU 未画完被扫描"
+- **每帧重建 EGLImage 后彻底消失** → vendor GPU 通过常驻 EGLImage 采样到陈旧缓存行（PanVK 重写 AHB 后未失效）；对应 MTK 内核 import flags 的 BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP（bit26，map/unmap 时同步）——每帧 create/destroy EGLImage 强制一轮 map/unmap 同步
+
+### 最终方案（v0.14，全部实证通过）
+1. **双缓冲 AHB plane**：两块 AHB 交替渲染/展示，读写时间分离
+2. **glFinish 在 swap 之前**：合成器永远不会扫到 GPU 还在写的缓冲
+3. **每帧重建 EGLImage**：强制 vendor kbase map/unmap 缓存同步
+4. **帧率节流 60fps** + vk_dead 优雅降级（保底不崩）
+5. AHB 内容扫描器（每 60 帧自检，当前 0 坏行）
+
+最终验证：4400+ 帧 / 75s+ 连续运行零 DEVICE_LOST，画面干净无伪影。debug.panvk.swap/finish/ms 属性保留供后续回归实验。
