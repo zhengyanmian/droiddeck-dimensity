@@ -526,3 +526,10 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 - 已排除：Termux box64（tur 源无 arm64 包）；no-proot glibc ld.so 直跑（SIGSYS/seccomp + libc.so 脚本体问题，绕过 LD_PRELOAD 后仍信号 31）
 - **明日首选：Mobox 架构**（olegos2/mobox）——成熟项目，box64+wine+DXVK 全套绕开 proot，只需把 PanVK ICD 通过 VK_DRIVER_FILES 注入其环境。次选：继续分析 proot wine 的 core dump（gdb under proot）
 - 所有工具/脚本/日志已提交（5c01561 后追加）
+
+## gdb 诊断结论（22:00）
+
+- SIGABRT 来自 wine 自身 abort()（dynarec 代码内，gdb 无法穿透回溯）
+- wine GUI/exec 在 box64+proot 三层嵌套下稳定崩溃（cmd 控制台路径可活）
+- 结论：转向 Mobox 架构（olegos2/mobox，成熟方案绕开 proot），PanVK ICD 通过 VK_DRIVER_FILES 注入
+- 明日 M1：Mobox APK 安装 + ICD 注入 + d3d11tri 验证
