@@ -508,3 +508,13 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 - 这条链 = 游戏→DXVK→PanVK→GPU→X11→屏幕 的完整通路，Wine/Steam 就跑在 glibc 世界
 - glibc 构建需 #ifdef __ANDROID__ 隔离 AHB 代码（android/hardware_buffer.h）
 - 下一步：Box64(Wine) + DXVK + Steam
+
+## 里程碑 K（2026-10-24 深夜）：Box64+Wine 部署与自动化管线
+
+- Box64 v0.4.5 Dynarec 编译安装完成（8 分钟，8 核）；Wine 11.20 amd64（Kron4ek）+ DXVK 2.7 就位
+- **全自动 adb 注入管线建成**：input text 注入 + 状态文件轮询，用户零操作
+- box64+wine 在 proot 里：wine --version ✓、wine cmd ✓（rc=0）、wineboot ✓（PREFIX_OK, PROOT_NO_SECCOMP=1）
+- 但 wine 进程创建（wineserver exec）撞 proot POKEDATA 限制，且呈**不稳定状态**（同命令时过时不过，疑多个卡死实例互相污染）→ 明日重启后首测
+- 已试过并记录的替代/修复：PROOT_NO_SECCOMP=1、heap 顺序回退（system 优先，干净固件上 GPU 可写确认，300 帧复验）、__ANDROID__ 宏隔离 glibc 构建、no-proot glibc ld.so 直跑（Termux LD_PRELOAD/信号 31 问题待解）
+- d3d11tri.exe（自研 x86 D3D11 三角形测试，313KB）已就位；VK_DRIVER_FILES=/root/panvk/panvk_icd.json 是 DXVK 找到 PanVK 的关键（今晚才发现没设）
+- 明日：重启手机清场 → 重跑 wineboot/cmd/d3d11tri → Steam → 欧卡 2
