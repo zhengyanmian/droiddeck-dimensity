@@ -142,3 +142,31 @@ panvk-probe.c / hmidump.c / hmidump2.c 编译管线已打通（PC 交叉编译 �
 3. 无 root 时 /dev/mali0 权限：shell 用户能否访问待真机确认（诊断脚本会查）。
 4. 性能预期：PanVK 目前即使跑通也远不如 Turnip 成熟，FEX + DXVK 全软件栈开销大，
    首个里程碑是"vkcube + vulkaninfo"，第二个是"Steam 大屏界面 30fps"，游戏是第三步。
+
+## Phase 2 里程碑 B：真机 kbase 直连 + 构建环境（2026-10-24）
+
+### 真机 GPU_ID 探测（kbase-gpuid 探针，免 root）
+- `RAW_GPU_ID = 0xe8800010`，按 Mesa PAN_* 宏解码：
+  - PAN_ARCH_MAJOR(bits31:28) = 0xE = **14**（pan_arch() 默认路径自动返回 14）
+  - arch_minor = 8, arch_rev = 8, product_major = 0
+- `CORE_FEATURES = 0x50000004` → gpu_variant = 低 8 位 = **0x04**
+- L2_FEATURES 0x081206, MEM_FEATURES 0x701
+
+### 重大利好：G1-Ultra 已在模型表内
+- `pan_model.c` 已有 `FIFTHGEN_MODEL(PAN_PROD_ID(14, 8, 0), 4, "G1-Ultra", "G1", ...)`，
+  prod_id 0xE0800 与真机完全匹配，variant 4 匹配 → **模型表零改动**
+- 全代码库 0 处硬编码 `arch == N`，全部为范围比较（>= 10 / >= 12），v14 自然走 CSF 路径
+- pan_arch() 默认路径 PAN_ARCH_MAJOR(gpu_id) 直接出新架构号，无需注册表补丁
+- NULL 模型会 VK_ERROR_INCOMPATIBLE_DRIVER（panvk_physical_device.c:1174），但我们不会踩到
+
+### WSL2 构建环境
+- WSL 3.0.3（winget 商店源超时 → ghproxy.net 下载 msixbundle → UAC 手动安装）
+- Ubuntu 24.04 rootfs 从 cloud-images.ubuntu.com 直连下载，wsl --import 为发行版 droiddeck-build
+- 补丁栈 GunaCharanTeja/panvk-kbase-android 经 ghproxy.net 克隆，Mesa 26.3.0-devel (5a07217f) 浅拉成功
+- `apply-patches.sh --profile g720-v12-csf`：20 个补丁全部干净套上（PATCH-DRIFT=0）
+- 教训：git bash 调 wsl.exe 需 MSYS_NO_PATHCONV=1，否则 /root/... 会被改写成 PortableGit 路径
+
+### 教训（网络路由）
+- winget/微软商店 CDN：国内直连部署超时 0x80072ee2
+- GitHub：直连/代理均不稳 → ghproxy.net 前缀镜像可用（git clone 与 release 下载均验证）
+- gitlab.freedesktop.org、cloud-images.ubuntu.com、archive/USTC apt 源：直连均可达
