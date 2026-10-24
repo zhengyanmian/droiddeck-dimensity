@@ -227,3 +227,27 @@ PROBE_SUCCESS
 ### 意义
 - 天玑 9500（Mali-G1-Ultra, CSF v12）从 "Turnip/Adreno only" 到 PanVK Vulkan 初始化打通，
   里程碑 A→D 全部完成；下一步为 DroidDeck 场景适配（绕开 gamescope 的 launch 管线 / proot glibc 消费端）
+
+## Phase 3 里程碑 E：真机 GPU 渲染验证通过（2026-10-24）
+
+### 渲染探针 tri-probe（offscreen，免 WSI/窗口系统）
+- 流程：CreateInstance(1.3) → CreateDevice → renderpass(clear红) → draw(3, 硬编码顶点, 片元输出绿) → 读回验证
+- 结果（LINEAR image 直读）：
+  center (128,128): R=0 G=255 B=0 → OK（三角形内部）
+  corner  (8,8):    R=255 G=0 B=0 → OK（clear 背景）
+  far corner / apex area：全部像素级正确
+- **图形管线全链路（VS → 光栅化 → FS → 输出）在 Mali-G1-Ultra 上真实工作**
+
+### 关键坑与修复（天玑 9500 / MTK CSF 内核）
+1. `KBASE_IOCTL_MEM_ALLOC_EX` (ioctl 59) 返回 ENOTTY：内核版本报告 ≥1.9 但缺该 ioctl
+   → fix-memalloc.py：ENOTTY 时自动回退 legacy `KBASE_IOCTL_MEM_ALLOC`（in/out ABI 一致）
+   修复前症状：vkCreateDevice 返回 VK_ERROR_EXTENSION_NOT_FOUND (-2)（误导性错误码）
+2. tri-probe 宏 bug：`#name` 丢 "vk" 前缀 → gipa 查询全部 NULL → SIGSEGV；修复 `"vk" #name`
+3. 排查工具链：fill-probe（CmdFillBuffer 0xAA 读回）证明 CSF 提交链路正常 → 定位问题在渲染/copy 路径
+
+### 已知问题
+- CopyImageToBuffer 读回全 0（linear image direct map 内容正确）——copy path 或布局同步问题，待查；不影响渲染能力本身
+
+### 对 DroidDeck 路线的意义
+- "绕开 gamescope" 的核心前提成立：GPU 能离屏渲染，后续可用 dmabuf/合成器路径输出画面
+- 里程碑 A→E 完成：厂商基线 → 硬件探针 → 自编译 ICD → 真机初始化 → **真机渲染**
