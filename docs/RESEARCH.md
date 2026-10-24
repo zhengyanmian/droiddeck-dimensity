@@ -500,3 +500,11 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 ### 新工具
 - kbase-scan12（MEM_ALLOC ABI 探针）、kbase-scan13（导入尺寸/枚举 bisect）、alloc-probe（普通分配循环渲染）、xcb-vk（XCB+Vulkan 冒烟测试，CBVK_NOACQUIRE/NOPRESENT 实验钩子）
 - WSL 交叉构建 glibc panvk 成功（dist/glibc-g720-v12-csf/，aarch64 glibc + x11 platform）——proot Ubuntu 直接可用
+
+## 里程碑 J（2026-10-24 晚）：glibc PanVK 在 proot Ubuntu 里 90 帧 X11 呈现成功
+
+- proot-distro Ubuntu + --shared-tmp（X 套接字共享）+ glibc 驱动 xcb-vk-glibc 90/90 XCB_VK_SUCCESS
+- 用户截图确认：GPU 识别、图像导入（bo_size=270336 走 AHB 路由）、swapchain、90 帧
+- 这条链 = 游戏→DXVK→PanVK→GPU→X11→屏幕 的完整通路，Wine/Steam 就跑在 glibc 世界
+- glibc 构建需 #ifdef __ANDROID__ 隔离 AHB 代码（android/hardware_buffer.h）
+- 下一步：Box64(Wine) + DXVK + Steam
