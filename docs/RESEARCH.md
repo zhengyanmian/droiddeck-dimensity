@@ -341,3 +341,38 @@ GPU0:
   无需额外 barrier（renderpass 隐式外部依赖覆盖）
 - 真机结果：RENDER_PASS_SUCCESS (copy + direct)，四点像素检查全 OK
   → 图形管线 + transfer 路径全部无已知问题
+
+## Phase 4 里程碑 G：AHardwareBuffer 显示桥打通（2026-10-24）
+
+### ahb-probe 端到端结果（AHB_ROUNDTRIP_SUCCESS）
+- AHardwareBuffer_allocate(gralloc, 256x256 RGBA8, GPU_COLOR_OUTPUT|CPU_READ_OFTEN)
+- vkGetAndroidHardwareBufferPropertiesANDROID 查询（262144B, memTypeBits=0x3）
+- vkCreateImage(VK_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, ANDROID_HARDWARE_BUFFER_BIT)
+- vkAllocateMemory(VkImportAndroidHardwareBufferInfoANDROID + dedicated) 导入成功
+- 渲染 pass → AHardwareBuffer_lock CPU 读取（合成器视角）：
+  center=绿(三角形) corner=红(clear) 像素级全部正确
+- 意义：PanVK 帧 → gralloc buffer → 任意 Android 消费端（SurfaceFlinger/应用），
+  "绕开 gamescope 上屏"的核心原语成立
+
+### 破案过程：MTK 内核 MEM_IMPORT 考古
+1. 首败：vkAllocateMemory 导入 AHB 报 INVALID_EXTERNAL_HANDLE
+   logcat: `kbase: KBASE_IOCTL_MEM_IMPORT failed: Inappropriate ioctl for device`
+2. ioctl 门禁：kbase 对未初始化上下文一律 EPERM（VERSION_CHECK→SET_FLAGS→tracking page
+   之前），裸 fd 扫描 ioctl 表不可行
+3. 反汇编 vendor libGLES_mali.so (53MB)：AArch64 立即数经 MOVZ/MOVK 拼装，
+   扫描指令对得 vendor 编码 = **IOWR(0x80,22,40)**（上游 union 24B → cmd 不匹配 ENOTTY）；
+   并确认 vendor flags OR bit26 (BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP)
+4. MTK 40B out 布局：flags@0x00(输入|NEED_MMAP 0x4000)、gpu_va cookie@0x08、
+   va_pages@0x10（是 VA span 计数，非 BO 页数——bo_size 改用 lseek(dma-buf)）
+5. 探针 ENOMEM 假象：`int fdp; memcpy(req+8,&fdp,8)` 从 4 字节对象拷 8 字节（UB），
+   clang 优化成传 fd 值 0x5 当指针 → 内核报 ENOMEM；改用 int* 参数后 import 即成功
+
+### 修复（fix-memimport.py，v0.12）
+- kbase_kmod.c：MTK 40B 联合体 + IOWR(0x80,22,40) + flags|SYNC_ON_MAP_UNMAP
+  + ENOMEM 重试(8 次×10ms) + bo_size 改 lseek(dma-buf)
+- 回归：tri-probe RENDER_PASS_SUCCESS (copy+direct) 通过
+
+### 后续（Phase 4 续）
+- 显示桥下一步：panvk AHB → SurfaceView/SurfaceFlinger 上屏（需一个宿主 APK 或
+  Termux:X11 场景）；VK_ANDROID_native_buffer/VK_KHR_swapchain 已在设备扩展列表
+- proot glibc 消费端管线待启动
