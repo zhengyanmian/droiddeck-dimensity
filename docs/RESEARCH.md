@@ -275,3 +275,28 @@ PROBE_SUCCESS
 ### 对 DroidDeck 路线的意义
 - "绕开 gamescope" 的核心前提成立：GPU 能离屏渲染，后续可用 dmabuf/合成器路径输出画面
 - 里程碑 A→E 完成：厂商基线 → 硬件探针 → 自编译 ICD → 真机初始化 → **真机渲染**
+
+## Phase 3 里程碑 F：系统 loader 集成成功（2026-10-24）
+
+### vulkaninfo --summary 端到端输出（Termux + vulkan-loader-generic 1.4.366）
+```
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+GPU0:
+        apiVersion  = 1.4.363
+        driverVersion = 26.2.99
+        vendorID    = 0x13b5 / deviceID = 0xe8800010
+        deviceName  = Mali-G1-Ultra MC12
+        driverID    = DRIVER_ID_MESA_PANVK
+        driverName  = panvk
+        driverInfo  = Mesa 26.3.0-devel (git-5a07217f03)
+```
+
+### 路径探索
+- vulkan-loader-android（AOSP loader）：忽略 VK_DRIVER_FILES，只扫系统分区 → 不可用
+- 方案：pkg install vulkan-loader-generic（mesa/Khronos loader，认 VK_DRIVER_FILES + $PREFIX/share/vulkan/icd.d）
+- ICD JSON：~/panvk/panvk_icd.json，library_path 绝对路径指向自编译 so；LD_LIBRARY_PATH 带 ~/panvk（libdrm.so 依赖）
+- 顺带收获：mesa-vulkan-icd-swrast（llvmpipe 软渲染）可作为 GPU 路径失败时的 fallback
+
+### 状态
+- 里程碑 A→F 全部完成：诊断 → 硬件探针 → 自编译 ICD → 真机初始化 → 真机渲染 → loader 集成
+- 下一步（Phase 4）：DroidDeck 场景管线——绕开 gamescope 的 launch 链路 / proot glibc 消费端 / 显示输出（dmabuf 合成）
