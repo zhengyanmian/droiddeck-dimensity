@@ -13,6 +13,14 @@ new54 = (
 
 lines[53] = new54
 
+# Fix 2 (2026-10-24): -Dplatforms=android,x11 pulls glibc X11 libs (libxcb & co.)
+# as DT_NEEDED into the ICD — unbootable on Android. Pure android WSI instead.
+if "-Dplatforms=android,x11" in lines[48]:
+    lines[48] = lines[48].replace("-Dplatforms=android,x11", "-Dplatforms=android")
+    print("FIXED platforms: android,x11 -> android")
+else:
+    print("platforms line already patched or moved; line 49 = " + lines[48])
+
 with open(path, "w") as f:
     f.writelines(lines)
 

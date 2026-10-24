@@ -191,3 +191,39 @@ panvk-probe.c / hmidump.c / hmidump2.c 编译管线已打通（PC 交叉编译 �
 - 预期：EnumeratePhysicalDevices 返回 1 个设备，deviceName 含 G1-Ultra，deviceID 匹配 0xe8800010
 - 手机断连（用户外出，无线调试休眠），恢复后执行：
   adb push libvulkan_panfrost.so icd-probe libdrm.so → LD_LIBRARY_PATH=/data/local/tmp ./icd-probe ./libvulkan_panfrost.so
+
+## Phase 3 里程碑 D：真机验证通过 —— 自编译 PanVK ICD 在天玑 9500 上完成 Vulkan 初始化（2026-10-24）
+
+### 首轮 icd-probe 结果（PROBE_SUCCESS）
+```
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+[ok] dlopen /data/local/tmp/libvulkan_panfrost.so
+[ok] ICD interface version: 5
+[ok] instance extensions: 13 (r=0)
+[ok] instance created
+[ok] physical devices: 1 (r=0)
+GPU0: Mali-G1-Ultra MC12 | api 1.4.363 | driver 0x6802063 | vendorID 0x13b5 | deviceID 0xe8800010
+PROBE_SUCCESS
+```
+- dlopen → ICD v5 协商 → CreateInstance → EnumeratePhysicalDevices 全链路通过（bionic 环境，免 loader）
+- deviceID 0xe8800010 与 kbase-gpuid 硬件探针完全一致；vendorID 0x13b5 = ARM
+- api 1.4.363：Mesa 26.3.0-devel 汇报的 Vulkan 版本
+- 13 个 instance extensions（vkEnumerateInstanceExtensionProperties）
+
+### 首轮失败与修复：X11 依赖污染
+- 症状：dlopen failed: library "libxcb.so.1" not found
+- 根因：build-android.sh `-Dplatforms=android,x11` 将 9 个 glibc X11 库硬链入 ICD
+  （libxcb.so.1 / libX11-xcb.so.1 / libxcb-dri3,present,xfixes,sync,randr,shm / libxshmfence）
+  —— 上游注释声称 "xcb 运行时 dlopen"，实际 Mesa 26.3 链接器行为是 DT_NEEDED 直链
+- 修复：`-Dplatforms=android`（纯 Android WSI）重编，2m35s 增量构建
+- 修复后 NEEDED 全为 bionic 库：liblog/libnativewindow/libsync/libdrm/libm/libdl/libc
+
+### 运维记录
+- GitHub 推送改走 SSH 22 端口（直连可达，梯子失效时可用）；remote 已改为 git@github.com:zhengyanmian/droiddeck-dimensity.git
+- WSL 内 NDK 位于 /opt/android-ndk-r28b；build-android.sh 参数必须命令行传（--profile/--ndk），不吃环境变量
+- adb push 本地路径用 C:/ 形式 + MSYS_NO_PATHCONV=1（/data/local/tmp 目标路径同理）
+- 设备：192.168.1.11:38467（柚谈工具箱重连）
+
+### 意义
+- 天玑 9500（Mali-G1-Ultra, CSF v12）从 "Turnip/Adreno only" 到 PanVK Vulkan 初始化打通，
+  里程碑 A→D 全部完成；下一步为 DroidDeck 场景适配（绕开 gamescope 的 launch 管线 / proot glibc 消费端）
