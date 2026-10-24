@@ -518,3 +518,11 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 - 已试过并记录的替代/修复：PROOT_NO_SECCOMP=1、heap 顺序回退（system 优先，干净固件上 GPU 可写确认，300 帧复验）、__ANDROID__ 宏隔离 glibc 构建、no-proot glibc ld.so 直跑（Termux LD_PRELOAD/信号 31 问题待解）
 - d3d11tri.exe（自研 x86 D3D11 三角形测试，313KB）已就位；VK_DRIVER_FILES=/root/panvk/panvk_icd.json 是 DXVK 找到 PanVK 的关键（今晚才发现没设）
 - 明日：重启手机清场 → 重跑 wineboot/cmd/d3d11tri → Steam → 欧卡 2
+
+## 深夜最终诊断（21:33-21:49）
+
+- 干净重启后复测：wine 进程创建 POKEDATA 失败**稳定复现**——非状态污染，是 proot+box64+wine execve 的结构性限制
+- 常驻 wineserver 方案有效绕过 spawn（wine cmd rc=0），但 d3d11tri.exe 本体 SIGABRT（core dump 无输出，ICD 绝对路径已修正仍崩）——需 core dump 分析或换架构
+- 已排除：Termux box64（tur 源无 arm64 包）；no-proot glibc ld.so 直跑（SIGSYS/seccomp + libc.so 脚本体问题，绕过 LD_PRELOAD 后仍信号 31）
+- **明日首选：Mobox 架构**（olegos2/mobox）——成熟项目，box64+wine+DXVK 全套绕开 proot，只需把 PanVK ICD 通过 VK_DRIVER_FILES 注入其环境。次选：继续分析 proot wine 的 core dump（gdb under proot）
+- 所有工具/脚本/日志已提交（5c01561 后追加）
