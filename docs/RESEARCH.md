@@ -542,3 +542,29 @@ PanVK 与 vendor GL 共用同一颗 Mali GPU（两个 kbase 客户端），GPU �
 - WINEDLLOVERRIDES 环境变量法替代 reg add 成功（不再依赖注册表写入）
 - stdio 在此栈完全不可靠 → 测试程序改为 freopen 直写文件（已重建）
 - 下一步两选：A) core dump + gdb 专项分析 wine 进程创建；B) Mobox（绕开 proot）
+## 里程碑 L（2026-10-25）：DXVK 在 Mali 上创建 D3D11 设备成功 + WSI 根因定位
+
+### 核心突破
+- **D3D11 设备在 Mali-G1-Ultra 上创建成功**：DXVK 1.10.3 + 特性申报补丁版 panvk → `D3D11CoreCreateDevice: Using feature level D3D_FEATURE_LEVEL_9_2` + `Device name: Mali-G1-Ultra MC12` → `[ok] D3D11 device created (hr=0)`
+- 特性补丁（patch-features.py）：panvk 特性上报改为 true 的 6 项 = geometryShader/tessellationShader/fillModeNonSolid/shaderClipDistance/shaderCullDistance/textureCompressionBC
+- DXVK 版本结论：2.7=box64 不识别的指令；2.0/2.3.1=要求 sparseBinding（panvk 无）；**1.10.3=可行**（Winlator 同款思路）
+
+### WSI 根因定位（下周第一任务）
+- **glibc panvk 构建的 WSI 后端错误地是 Android**（panvk_wsi.c: `create_swapchain = panvk_wsi_android_create_swapchain`）——wine/DXVK 需要 X11 WSI
+- 崩溃签名：wine loader_thunks.c `assert(!status && "vkCreateSwapchainKHR")` = UNIX_CALL 机制失败（unix 侧崩溃），发生在 X11 WSI 被调用之前
+- vktri.exe（纯 Win32 Vulkan swapchain 测试，无 DXVK）可复现同一 assert——极简诊断工具已入库
+- 修复路径：proot 容器装 X11 dev 头文件（mobo65 脚本，apt 未完成待重跑）→ meson configure -Dplatforms=x11 → 重编 glibc panvk → X11 swapchain 应直接可用
+- 注意：300 帧"成功"实为 Android bufferqueue 无头空转（无实际显示）——X11 WSI 版才是真显示路径
+- 另发现：box64 WRAPS libvulkan（wrappedvulkan.c），RPATH/LD_LIBRARY_PATH 对包装层 host dlopen 的生效规则已摸清（--force-rpath 必需）
+
+### 市场定位
+- DroidDeck（Droid-Deck/DroidDeck，万 Star）= Valve ARM64 Steam + Proton + FEX + Turnip，**官方不支持 Mali/天玑**
+- 我们的 PanVK 驱动 = 补上 DroidDeck 天玑生态的钥匙（Turnip 同类组件）
+
+### 待办（下周）
+1. mobo65 的 apt 装 X11 dev 包（可能要重跑）
+2. meson configure -Dplatforms=x11 重编 glibc panvk
+3. vktri.exe 验证 X11 swapchain → d3d11tri 三角形
+4. Steam + 欧卡 2
+
+commits: 445e492 → 本轮

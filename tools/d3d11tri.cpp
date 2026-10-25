@@ -42,8 +42,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ID3D11Device *dev = NULL; ID3D11DeviceContext *ctx = NULL;
     HRESULT hr = D3D11CreateDevice(ad, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
                                    &fl, 1, D3D11_SDK_VERSION, &dev, NULL, &ctx);
-    if (FAILED(hr)) { printf("FAIL D3D11CreateDevice hr=0x%08lx\n", (unsigned long)hr); return 1; }
-    printf("[ok] D3D11 device @ FL 11_0\n");
+    printf("[try1 adapter+UNKNOWN 11_0] hr=0x%08lx\n", (unsigned long)hr);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(ad, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+                               NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+        printf("[try2 adapter+UNKNOWN default] hr=0x%08lx\n", (unsigned long)hr);
+    }
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                               &fl, 1, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+        printf("[try3 NULL+HARDWARE 11_0] hr=0x%08lx\n", (unsigned long)hr);
+    }
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                               NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+        printf("[try4 NULL+HARDWARE default] hr=0x%08lx\n", (unsigned long)hr);
+    }
+    if (FAILED(hr)) { printf("FAIL D3D11CreateDevice all variants\n"); return 1; }
+    printf("[ok] D3D11 device created\n");
 
     HWND wnd = CreateWindowExA(0, "STATIC", "d3d11tri", WS_OVERLAPPEDWINDOW,
                                50, 50, 800, 600, NULL, NULL, hInst, NULL);
